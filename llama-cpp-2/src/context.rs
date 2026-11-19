@@ -96,6 +96,12 @@ impl<'model> LlamaContext<'model> {
         unsafe { llama_cpp_sys_2::llama_n_ctx(self.context.as_ptr()) }
     }
 
+    /// Sets whether decoding outputs embeddings. When it does, every token in a batch is output;
+    /// otherwise only the logits of the tokens marked for output are.
+    pub fn set_embeddings(&mut self, embeddings: bool) {
+        unsafe { llama_cpp_sys_2::llama_set_embeddings(self.context.as_mut_ptr(), embeddings) }
+    }
+
     /// Decodes the batch.
     ///
     /// # Errors
