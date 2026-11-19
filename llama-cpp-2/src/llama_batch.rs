@@ -9,6 +9,8 @@ use std::marker::PhantomData;
 pub struct LlamaBatch<'a> {
     /// The number of tokens the batch was allocated with. they are safe to write to - but not necessarily read from as they are not necessarily initialized
     allocated: usize,
+    /// The size of each embedding in a batch of embeddings, or 0 in a batch of tokens
+    n_embd: usize,
     #[allow(clippy::doc_markdown)]
     /// The llama_cpp batch. always initialize by `llama_cpp_sys_2::llama_batch_init(allocated, <unknown>, <unknown>)`
     pub(crate) llama_batch: llama_batch,
@@ -29,6 +31,15 @@ pub enum BatchAddError {
     /// Empty buffer is provided for [`LlamaBatch::get_one`]
     #[error("Empty buffer")]
     EmptyBuffer,
+    /// The input does not match the batch: a token added to a batch of embeddings, an embedding
+    /// added to a batch of tokens, or an embedding of the wrong size.
+    #[error("Expected an embedding of size {expected} (0 for a token), got {actual}")]
+    EmbdSizeMismatch {
+        /// The size of the batch's embeddings, or 0 for a batch of tokens
+        expected: usize,
+        /// The size of the input, or 0 for a token
+        actual: usize,
+    },
 }
 
 impl<'a> LlamaBatch<'a> {
@@ -48,7 +59,8 @@ impl<'a> LlamaBatch<'a> {
     ///
     /// # Errors
     ///
-    /// returns a error if there is insufficient space in the buffer
+    /// returns a error if there is insufficient space in the buffer, or if the batch holds
+    /// embeddings
     pub fn add(
         &mut self,
         LlamaToken(id): LlamaToken,
@@ -56,6 +68,75 @@ impl<'a> LlamaBatch<'a> {
         seq_ids: &[i32],
         logits: bool,
     ) -> Result<(), BatchAddError> {
+        if self.n_embd != 0 {
+            return Err(BatchAddError::EmbdSizeMismatch {
+                expected: self.n_embd,
+                actual: 0,
+            });
+        }
+        let offset = self.add_entry(pos, seq_ids, logits)?;
+        // batch.token[offset] = id;
+        unsafe { self.llama_batch.token.add(offset).write(id) };
+        Ok(())
+    }
+
+    /// Add an embedding to a batch created with [`LlamaBatch::new_embd`], for sequences `seq_ids`
+    /// at position `pos`. The model reads it in place of a token's embedding. If `logits` is true,
+    /// the output for it can be read after the next decode.
+    ///
+    /// # Panics
+    ///
+    /// - [`self.llama_batch.n_tokens`] does not fit into a usize
+    /// - [`seq_ids.len()`] does not fit into a [`llama_seq_id`]
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if there is insufficient space in the buffer, or if `embd` does not have
+    /// the size of the batch's embeddings.
+    ///
+    /// ```
+    /// # use llama_cpp_2::llama_batch::{BatchAddError, LlamaBatch};
+    /// let mut batch = LlamaBatch::new_embd(2, 4, 1);
+    /// batch.add_embd(&[0.0, 1.0, 2.0, 3.0], 0, &[0], false)?;
+    /// assert_eq!(
+    ///     batch.add_embd(&[0.0, 1.0], 1, &[0], true),
+    ///     Err(BatchAddError::EmbdSizeMismatch { expected: 4, actual: 2 })
+    /// );
+    /// assert_eq!(batch.n_tokens(), 1);
+    /// # Ok::<(), BatchAddError>(())
+    /// ```
+    pub fn add_embd(
+        &mut self,
+        embd: &[f32],
+        pos: llama_pos,
+        seq_ids: &[i32],
+        logits: bool,
+    ) -> Result<(), BatchAddError> {
+        if self.n_embd == 0 || embd.len() != self.n_embd {
+            return Err(BatchAddError::EmbdSizeMismatch {
+                expected: self.n_embd,
+                actual: embd.len(),
+            });
+        }
+        let offset = self.add_entry(pos, seq_ids, logits)?;
+        // memcpy(batch.embd + offset * n_embd, embd, n_embd * sizeof(float));
+        unsafe {
+            self.llama_batch
+                .embd
+                .add(offset * self.n_embd)
+                .copy_from_nonoverlapping(embd.as_ptr(), self.n_embd);
+        }
+        Ok(())
+    }
+
+    /// Append an entry with everything but its token or embedding, which the caller writes at
+    /// the returned offset.
+    fn add_entry(
+        &mut self,
+        pos: llama_pos,
+        seq_ids: &[i32],
+        logits: bool,
+    ) -> Result<usize, BatchAddError> {
         if self.allocated
             < usize::try_from(self.n_tokens() + 1).expect("cannot fit n_tokens into a usize")
         {
@@ -64,8 +145,6 @@ impl<'a> LlamaBatch<'a> {
         let offset = self.llama_batch.n_tokens;
         let offset_usize = usize::try_from(offset).expect("cannot fit n_tokens into a usize");
         unsafe {
-            // batch.token   [batch.n_tokens] = id;
-            self.llama_batch.token.add(offset_usize).write(id);
             // batch.pos     [batch.n_tokens] = pos,
             self.llama_batch.pos.add(offset_usize).write(pos);
             // batch.n_seq_id[batch.n_tokens] = seq_ids.size();
@@ -90,7 +169,7 @@ impl<'a> LlamaBatch<'a> {
         // batch.n_tokens++;
         self.llama_batch.n_tokens += 1;
 
-        Ok(())
+        Ok(offset_usize)
     }
 
     /// Add a sequence of tokens to the batch for the given sequence id. If `logits_all` is true, the
@@ -100,7 +179,8 @@ impl<'a> LlamaBatch<'a> {
     ///
     /// # Errors
     ///
-    /// Returns an error if there is insufficient space in the buffer
+    /// Returns an error if there is insufficient space in the buffer, or if the batch holds
+    /// embeddings
     ///
     /// # Panics
     ///
@@ -146,6 +226,34 @@ impl<'a> LlamaBatch<'a> {
 
         LlamaBatch {
             allocated: n_tokens,
+            n_embd: 0,
+            llama_batch: batch,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Create a new `LlamaBatch` that can contain up to `n_tokens` embeddings of size `n_embd`
+    /// instead of tokens (see [`LlamaBatch::add_embd`]).
+    ///
+    /// # Arguments
+    ///
+    /// - `n_tokens`: the maximum number of embeddings that can be added to the batch
+    /// - `n_embd`: the size of each embedding, the model's embedding size
+    /// - `n_seq_max`: the maximum number of sequences that can be added to the batch
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_embd` is 0, or `n_tokens` or `n_embd` is greater than `i32::MAX`.
+    #[must_use]
+    pub fn new_embd(n_tokens: usize, n_embd: usize, n_seq_max: i32) -> Self {
+        assert!(n_embd > 0, "n_embd must be positive");
+        let n_tokens_i32 = i32::try_from(n_tokens).expect("cannot fit n_tokens into a i32");
+        let n_embd_i32 = i32::try_from(n_embd).expect("cannot fit n_embd into a i32");
+        let batch = unsafe { llama_batch_init(n_tokens_i32, n_embd_i32, n_seq_max) };
+
+        LlamaBatch {
+            allocated: n_tokens,
+            n_embd,
             llama_batch: batch,
             phantom: PhantomData,
         }
@@ -177,6 +285,7 @@ impl<'a> LlamaBatch<'a> {
         };
         let batch = Self {
             allocated: 0,
+            n_embd: 0,
             llama_batch: batch,
             phantom: PhantomData,
         };
